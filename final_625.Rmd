@@ -1,0 +1,368 @@
+---
+title: "625_final"
+author: "Xinyu Zhang"
+date: "2023-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Install package
+```{r}
+install.packages("keras")
+install.packages("e1071")
+install.packages("caret")
+install.packages("doParallel")
+install.packages("sparklyr")
+library(readr)
+library(keras)
+library(doParallel)
+library(foreach)
+library(parallel)
+library(e1071)
+library(caret)
+library(randomForest)
+library(sparklyr)
+library(dplyr)
+
+library(glmnet)
+library(ridge)
+library(lars)
+```
+
+
+
+
+```{r}
+files <- list.files(path = "D:/625/final_data", pattern = "*.csv", full.names = TRUE)
+
+read_csv <- function(file_path) {
+  read.csv(file_path)
+}
+desired_columns <- c("IYEAR","NUMADULT", "RENTHOM1", "HLTHPLN1", "EMPLOY1",
+                     "PVTRESD1", "MEDCOST", "CHILDREN", "INCOME2", "MENTHLTH")
+
+read_and_extract <- function(file_path) {
+  data <- read.csv(file_path)
+  data[desired_columns[desired_columns %in% names(data)]]
+}
+
+cl <- makeCluster(detectCores() - 1)
+
+clusterExport(cl, varlist = c("desired_columns", "read_and_extract"))
+
+all_data_list <- parLapply(cl, files, read_and_extract)
+
+stopCluster(cl)
+
+all_data <- do.call(rbind, all_data_list)
+
+write.csv(all_data, "merged_data.csv", row.names = FALSE)
+```
+
+### Random Forest
+```{r}
+all_data = read.csv("merged_data.csv")
+data = na.omit(all_data)
+data <- data[data$MENTHLTH <= 70, ]
+data <- data[data$CHILDREN <= 20, ]
+data <- data[data$INCOME2 <= 70, ]
+data$MENTHLTH <- cut(data$MENTHLTH, breaks = c(1, 5, 10, 15, 20, 25, Inf), labels = c("1", "2", "3", "4", "5", "6"), right = FALSE)
+
+summary(data$MENTHLTH)
+
+data$IYEAR <- gsub("b'", "", data$IYEAR)
+data$IYEAR <- gsub("'", "", data$IYEAR) 
+data$IYEAR <- as.integer(data$IYEAR)
+data$IYEAR <- data$IYEAR - 2020
+
+summary(data$IYEAR)
+
+set.seed(123)
+data_index <- sample(1:nrow(data), size = 0.7 * nrow(data))
+train_set <- data[data_index, ]
+test_set <- data[-data_index, ]
+
+write.csv(data, "final_data.csv", row.names = FALSE)
+```
+
+
+```{r}
+#parallel
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+rf_parallel_time <- system.time({
+    rf_model_parallel <- randomForest(MENTHLTH ~ ., data = train_set)})
+stopCluster(cl)
+#base
+system.time({
+  model_base <- randomForest(MENTHLTH ~ ., data = train_set)
+}) -> time_base_rf
+
+#spark 46.35
+spark_available_versions()
+spark_install(version = 3.3)
+sc <- spark_connect(master = "local")
+options(rstudio.connectionObserver.errorsSuppressed = TRUE)
+options("sparklyr.simple.errors" = TRUE)
+sc <- spark_connect(master = "local", config = list("spark.executor.memory" = "4g"))
+sdf <- copy_to(sc, data, "data", overwrite = TRUE)
+train_sdf <- copy_to(sc, train_set, "train_set", overwrite = TRUE)
+test_sdf <- copy_to(sc, test_set, "test_set", overwrite = TRUE)
+
+system.time({
+  rf_model_spark <- train_sdf %>%
+    ml_random_forest(MENTHLTH ~ .)
+}) -> time_spark_rf
+
+
+predictions <- ml_predict(rf_model_spark, test_sdf)
+predictions_with_labels <- predictions %>%
+    mutate(actual = test_sdf$MENTHLTH)
+accuracy_df <- predictions_with_labels %>%
+    mutate(correct = prediction == actual) %>%
+    summarize(accuracy = mean(correct))
+predictions %>% collect()
+collected_predictions <- collect(accuracy_df)
+spark_disconnect(sc)
+accuracy <- sum(predictions$predicted_label == test_set$MENTHLTH) / nrow(test_set)
+```
+
+
+```{r}
+efficiency_comparison <- data.frame(
+  Model = c("Base", "Parallel"),
+  Time = c(rf_base_time[3], rf_parallel_time[3])
+)
+
+```
+
+
+
+
+```{r}
+#2022
+data_2022 <- read.csv("merged_data.csv")
+```
+
+
+
+
+
+### CNN Model
+```{r}
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = 'relu', input_shape = c(ncol(train_features))) %>%
+  layer_dense(units = 64, activation = 'relu') %>%
+  layer_dense(units = ncol(labels), activation = 'softmax') # 假设标签是多分类
+```
+### Compile
+```{r}
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = 'adam',
+  metrics = c('accuracy')
+)
+```
+
+### Train model
+```{r}
+history <- model %>% fit(
+  train_features, train_labels,
+  epochs = 50,
+  batch_size = 32,
+  validation_split = 0.2
+)
+```
+
+### Evaluate
+```{r}
+model %>% evaluate(test_features, test_labels)
+```
+
+### Final Data and Train & Test
+```{r}
+brfss = read_csv("final_data.csv")
+set.seed(123)
+data_index <- sample(1:nrow(brfss), size = 0.7 * nrow(brfss))
+train_set <- brfss[data_index, ]
+test_set <- brfss[-data_index, ]
+x<-as.matrix(train_set[,1:9])
+y<-as.matrix(train_set[,10])
+x_test = as.data.frame(test_set[, 1:9])
+y_test = as.data.frame(test_set[, 10])
+```
+
+# Linear Regression function in Rcpp
+```{Rcpp}
+// [[Rcpp::depends(Rcpp)]]
+#include <Rcpp.h>
+#include <vector>
+#include <iostream>
+//#include "fit_mlr.h"
+
+std::vector<std::vector<double>> inverseMatrix(const std::vector<std::vector<double>>& M) {
+  int n = M.size();
+  std::vector<std::vector<double>> matrix(n, std::vector<double>(2*n, 0.0));
+  for (int i=0; i < n; ++i) {
+    matrix[i][i+n] = 1;
+    for (int j = 0; j < n; ++j) {
+      matrix[i][j] = M[i][j];
+    }
+  }
+  for (int i=0; i < n; ++i) {
+    double pivot = matrix[i][i];
+    for (int j=0; j < 2*n; ++j) {
+      matrix[i][j] /= pivot;
+    }
+
+    for (int k=0; k < n; ++k) {
+      if (k!=i) {
+        double factor = matrix[k][i];
+        for (int j=0; j < 2*n; ++j) {
+          matrix[k][j] -= factor*matrix[i][j];
+        }
+      }
+    }
+  }
+  std::vector<std::vector<double>> inverse(n, std::vector<double>(n, 0.0));
+  for (int i = 0; i < n; ++i) {
+    for (int j = 0; j < n; ++j) {
+      inverse[i][j] = matrix[i][j + n];
+    }
+  }
+  return inverse;
+}
+// [[Rcpp::export]]
+Rcpp::NumericVector fit_mlr(Rcpp::NumericVector y, Rcpp::NumericMatrix x) {
+  if (x.nrow() == y.size()) {
+    size_t var = x.ncol() + 1;
+    Rcpp::NumericMatrix X(x.nrow(), var);
+    for (size_t i=0; i<x.nrow(); ++i) {
+      X(i, 0) = 1;
+      for (int j=1; j<var; ++j) {
+        X(i, j) = x(i, j-1);
+      }
+    }
+    std::vector<std::vector<double>> XTX(var, std::vector<double>(var, 0.0));
+    for (int i = 0; i < var; ++i) {
+      for (int j = 0; j < var; ++j) {
+        for (int k = 0; k < x.nrow(); ++k) {
+          XTX[i][j] += X(k, i) * X(k, j);
+        }
+      }
+    }
+    std::vector<double> XTY(var, 0.0);
+    for (int i = 0; i < var; ++i) {
+      for (int j = 0; j < x.nrow(); ++j) {
+        XTY[i] += X(j, i) * y(j);
+      }
+    }
+    std::vector<std::vector<double>> inverse_XTX = inverseMatrix(XTX);
+    std::vector<double> estimators(var, 0.0);
+    for (int i=0; i<var; ++i) {
+      for (int j=0; j<var; ++j) {
+        estimators[i] += inverse_XTX[i][j]*XTY[j];
+      }
+    }
+    Rcpp::NumericVector estimators_list(estimators.begin(), estimators.end());
+    return estimators_list;
+  }
+  else {
+    std::cout<<"length are not the same"<<std::endl;
+    return NULL;
+  }
+}
+```
+
+
+### Multiple Linear Regression
+```{r}
+# Basic method:
+mlr_mod = lm(MENTHLTH ~ ., data = train_set)
+predictions <- predict(mlr_mod, newdata = test_set)
+summary(mlr_mod)
+
+# Improved method:
+coefficients = fit_mlr(y, x)
+names(coefficients) = c("(Intercept)", colnames(x))
+print(coefficients)
+predictions <- cbind(1, as.matrix(x_test)) %*% coefficients
+
+# Compare speed:
+mlr_time <- system.time({
+  predictions_basic <- predict(mlr_mod, newdata = test_set)
+  summary(mlr_mod)
+})
+mlr_time_improved <- system.time({
+  predictions_improved <- cbind(1, as.matrix(x_test)) %*% coefficients
+})
+print(mlr_time)
+print(mlr_time_improved)
+
+# Check MAE, MSE, R-squared:
+mse = mean((test_set$MENTHLTH - predictions)^2)
+mae = mean(abs(test_set$MENTHLTH - predictions))
+r_squared = 1 - sum((test_set$MENTHLTH - predictions)^2) / sum((test_set$MENTHLTH - mean(test_set$MENTHLTH))^2)
+var_y = var(test_set$MENTHLTH)
+nmse = mse / var_y
+print(mse)
+print(mae)
+print(r_squared)
+print(nmse)
+```
+
+
+### Ridge Regression
+```{r}
+# Basic method:
+r1<-glmnet(x=x,y=y,family = "gaussian",alpha = 0)
+plot(r1,xvar="lambda")
+r1cv<-cv.glmnet(x=x,y=y,family="gaussian",alpha=0,nfolds = 10)
+plot(r1cv)
+
+# Continue with Process:
+rimin<-glmnet(x=x,y=y,family = "gaussian",alpha = 0,lambda = r1cv$lambda.min)
+coef(rimin)
+rimin<-glmnet(x=x,y=y,family = "gaussian",alpha = 0,lambda = r1cv$lambda.1se)
+coef(rimin)
+ridge_mod <- linearRidge(MENTHLTH ~ ., data = train_set,lambda = r1cv$lambda.min)
+predictions <- predict(ridge_mod, newdata = x_test)
+
+# Check MAE, MSE, R-squared:
+mse = mean((test_set$MENTHLTH - predictions)^2)
+mae = mean(abs(test_set$MENTHLTH - predictions))
+r_squared = 1 - sum((test_set$MENTHLTH - predictions)^2) / sum((test_set$MENTHLTH - mean(test_set$MENTHLTH))^2)
+print(mse)
+print(mae)
+print(r_squared)
+```
+
+
+### LASSO regression
+```{r}
+# Basic method:
+brfss_lar<-lars(x,y,type="lasso")
+plot(brfss_lar)
+f1 = glmnet(x, y, family="mgaussian", nlambda=100, alpha=1)
+plot(f1, xvar="lambda", label=TRUE)
+
+cvfit=cv.glmnet(x,y)
+plot(cvfit)
+l.coef1<-coef(cvfit$glmnet.fit,s=cvfit$lambda.min,exact=F)
+l.coef2<-coef(cvfit$glmnet.fit,s=cvfit$lambda.1se,exact=F)
+brfss_las<-glm(MENTHLTH~.,family="gaussian",data=train_set)
+summary(brfss_las)
+predictions <- predict(brfss_las, newdata = x_test)
+
+mse <- mean((test_set$MENTHLTH - predictions)^2)
+mae <- mean(abs(test_set$MENTHLTH - predictions))
+r_squared = 1 - sum((test_set$MENTHLTH - predictions)^2) / sum((test_set$MENTHLTH - mean(test_set$MENTHLTH))^2)
+print(mse)
+print(mae)
+print(r_squared)
+```
+
+
